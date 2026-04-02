@@ -3,9 +3,6 @@ __pycache__/
 *.pyc
 .git/
 .dockerignore
-Dockerfile
-docker-compose.yml
-requirements.txt
 README.md
 walkthrough.md
 implementation_plan.md
