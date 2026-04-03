@@ -5,11 +5,13 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 # Cài đặt FFmpeg và các thư viện cần thiết cho âm thanh
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libffi-dev \
     libnacl-dev \
+    libsodium-dev \
     python3-dev \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Thiết lập thư mục làm việc
