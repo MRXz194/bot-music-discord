@@ -1,8 +1,9 @@
 # ============================================================
-#  🎵 Discord Music Bot — Jockie Music Clone
+#  🎵 Discord Music Bot — Jockie Music Clone (v2.0)
 #  Stack : discord.py 2.7 + yt-dlp + FFmpeg
+#  Changes: Bug fixes, stability, UX improvements
 # ============================================================
-import os, asyncio, random, datetime, discord
+import os, asyncio, random, datetime, discord, re
 from discord.ext import commands
 from dotenv import load_dotenv
 import yt_dlp
@@ -37,7 +38,7 @@ YTDL_OPTS = {
     "no_warnings": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
-    "socket_timeout": 10,
+    "socket_timeout": 15,
     "retries": 3,
     "extract_flat": "in_playlist",
     "extractor_args": {"youtube": {"skip": ["dash", "hls"], "player_client": ["android", "web"]}},
@@ -50,7 +51,7 @@ FFMPEG_OPTS = {
 
 def _find_ffmpeg():
     import shutil, subprocess, glob
-    
+
     # 1. Check PATH (Works on Linux/Docker and Windows if added to PATH)
     found = shutil.which("ffmpeg")
     if found: return found
@@ -116,6 +117,13 @@ class Song:
         return e
 
 # ─────────────────────────────────────────────────────────────
+#  LOOP MODE ENUM
+# ─────────────────────────────────────────────────────────────
+LOOP_OFF      = 0
+LOOP_PLAYLIST = 1
+LOOP_SINGLE   = 2
+
+# ─────────────────────────────────────────────────────────────
 #  GUILD STATE
 # ─────────────────────────────────────────────────────────────
 class GuildState:
@@ -124,13 +132,18 @@ class GuildState:
         self.queue:   list[Song] = []
         self.history: list[Song] = []
         self.current: Song | None = None
-        self.loop     = False
+        self.loop     = LOOP_OFF        # 0=off, 1=playlist, 2=single
         self.volume   = 0.5
         self.voice:   discord.VoiceClient | None = None
         self._adv     = False   # advancing guard
 
     def playing(self): return self.voice is not None and self.voice.is_playing()
     def paused(self):  return self.voice is not None and self.voice.is_paused()
+
+    def loop_label(self):
+        if self.loop == LOOP_PLAYLIST: return "🔁 Playlist"
+        if self.loop == LOOP_SINGLE:   return "🔂 Single"
+        return "OFF"
 
     def reset(self):
         self.queue.clear(); self.history.clear()
@@ -152,7 +165,7 @@ async def fetch_info(query: str) -> list[dict]:
     try:
         data = await asyncio.wait_for(
             bot.loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False)),
-            timeout=30.0
+            timeout=60.0     # tăng lên 60s cho playlist lớn
         )
     except asyncio.TimeoutError:
         raise commands.CommandError("⏳ Tìm kiếm quá lâu! Thử dùng URL trực tiếp.")
@@ -161,25 +174,29 @@ async def fetch_info(query: str) -> list[dict]:
     entries = data.get("entries", [data]) if "entries" in data else [data]
     return [e for e in entries if e]
 
-async def refresh_song(song: Song):
-    """Re-extract fresh stream URL and full metadata right before playback."""
+# [Bug 3 Fix] refresh_song trả về True/False
+async def refresh_song(song: Song) -> bool:
+    """Re-extract fresh stream URL. Returns True on success, False on failure."""
     try:
         opts = dict(YTDL_OPTS)
-        opts["extract_flat"] = False   # need full info for single URL
-        opts["noplaylist"] = True      # CRITICAL: only extract the single track
+        opts["extract_flat"] = False
+        opts["noplaylist"] = True
         ytdl = yt_dlp.YoutubeDL(opts)
         data = await asyncio.wait_for(
             bot.loop.run_in_executor(None, lambda: ytdl.extract_info(song.webpage_url, download=False)),
             timeout=15.0
         )
-        if data:
+        if data and data.get("url"):
             song.url       = data.get("url", song.url)
             song.title     = data.get("title", song.title) or "Unknown"
             song.duration  = data.get("duration", song.duration)
             song.thumbnail = data.get("thumbnail", song.thumbnail)
             song.uploader  = data.get("uploader", song.uploader) or "Unknown"
+            return True
+        return False
     except Exception as e:
         print(f"[Refresh Error] {e}")
+        return False
 
 def make_source(url: str, volume: float) -> discord.PCMVolumeTransformer:
     return discord.PCMVolumeTransformer(
@@ -187,7 +204,67 @@ def make_source(url: str, volume: float) -> discord.PCMVolumeTransformer:
     )
 
 # ─────────────────────────────────────────────────────────────
-#  ADVANCE QUEUE
+#  PLAYER CONTROLS VIEW (UX 1 — Interactive Buttons)
+# ─────────────────────────────────────────────────────────────
+class PlayerView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, ch: discord.TextChannel):
+        super().__init__(timeout=600)  # 10 phút timeout
+        self.guild = guild
+        self.ch = ch
+
+    @discord.ui.button(label="⏸", style=discord.ButtonStyle.secondary)
+    async def btn_pause(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = gs(self.guild)
+        if state.playing():
+            state.voice.pause()
+            button.label = "▶"
+            button.style = discord.ButtonStyle.success
+            await interaction.response.edit_message(view=self)
+        elif state.paused():
+            state.voice.resume()
+            button.label = "⏸"
+            button.style = discord.ButtonStyle.secondary
+            await interaction.response.edit_message(view=self)
+        else:
+            await interaction.response.defer()
+
+    @discord.ui.button(label="⏭", style=discord.ButtonStyle.primary)
+    async def btn_skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = gs(self.guild)
+        if state.playing() or state.paused():
+            state.voice.stop()
+            await interaction.response.send_message(
+                embed=discord.Embed(description="⏭️ Đã skip.", color=0x1DB954), delete_after=5
+            )
+        else:
+            await interaction.response.defer()
+
+    @discord.ui.button(label="⏹", style=discord.ButtonStyle.danger)
+    async def btn_stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = gs(self.guild)
+        state.reset()
+        if state.voice and state.voice.is_connected():
+            state.voice.stop()
+        await interaction.response.send_message(
+            embed=discord.Embed(description="⏹️ Đã dừng và xóa queue.", color=0xFF6B6B), delete_after=5
+        )
+        self.stop()
+
+    @discord.ui.button(label="🔀", style=discord.ButtonStyle.secondary)
+    async def btn_shuffle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = gs(self.guild)
+        if state.queue:
+            random.shuffle(state.queue)
+            if state.loop == LOOP_PLAYLIST and state.history:
+                random.shuffle(state.history)
+            await interaction.response.send_message(
+                embed=discord.Embed(description="🔀 Đã xáo trộn queue!", color=0x1DB954), delete_after=5
+            )
+        else:
+            await interaction.response.defer()
+
+# ─────────────────────────────────────────────────────────────
+#  ADVANCE QUEUE (Bug 1, 3 fixes)
 # ─────────────────────────────────────────────────────────────
 async def advance(guild: discord.Guild, ch: discord.TextChannel):
     state = gs(guild)
@@ -200,10 +277,13 @@ async def advance(guild: discord.Guild, ch: discord.TextChannel):
             state.current = None; state._adv = False; return
         state.voice = vc
 
-        # Pick song
-        if state.queue:
+        # [UX 4] Loop single — replay current song
+        if state.loop == LOOP_SINGLE and state.current:
+            song = state.current
+        # Pick song from queue
+        elif state.queue:
             song = state.queue.pop(0)
-        elif state.loop and state.history:
+        elif state.loop == LOOP_PLAYLIST and state.history:
             state.queue = list(state.history); state.history.clear()
             song = state.queue.pop(0)
             try: await ch.send(embed=discord.Embed(description="🔁 Loop – Phát lại từ đầu!", color=0x1DB954))
@@ -214,11 +294,22 @@ async def advance(guild: discord.Guild, ch: discord.TextChannel):
             except: pass
             state._adv = False; return
 
-        # Refresh track metadata and URL
-        await refresh_song(song)
+        # [Bug 3 Fix] Refresh track — skip on failure
+        ok = await refresh_song(song)
+        if not ok:
+            try:
+                await ch.send(embed=discord.Embed(
+                    description=f"❌ Không thể tải **{song.title}**, tự bỏ qua...", color=0xFF6B6B
+                ))
+            except: pass
+            state._adv = False
+            await asyncio.sleep(2)  # tránh spam khi nhiều bài lỗi liên tiếp
+            asyncio.ensure_future(advance(guild, ch))
+            return
 
         state.current = song
-        if state.loop: state.history.append(song)
+        # [Bug 1 Fix] Chỉ ghi history tại đây — nguồn DUY NHẤT
+        if state.loop == LOOP_PLAYLIST: state.history.append(song)
 
         def after(err):
             if err: print(f"[Player] {err}")
@@ -228,15 +319,18 @@ async def advance(guild: discord.Guild, ch: discord.TextChannel):
         src = make_source(song.url, state.volume)
         if state.voice and state.voice.is_connected():
             state.voice.play(src, after=after)
-            pos = len(state.history) if state.loop else 1
-            tot = len(state.history)+len(state.queue) if state.loop else len(state.queue)+1
-            try: await ch.send(embed=song.embed(pos, tot))
+            pos = len(state.history) if state.loop == LOOP_PLAYLIST else 1
+            tot = len(state.history)+len(state.queue) if state.loop == LOOP_PLAYLIST else len(state.queue)+1
+            view = PlayerView(guild, ch)
+            try: await ch.send(embed=song.embed(pos, tot, paused=False), view=view)
             except: pass
         else:
             state._adv = False
     except Exception as e:
         print(f"[Advance] {e}")
         state._adv = False
+        # [Bug 3 Fix] Delay trước khi retry tránh CPU spike
+        await asyncio.sleep(2)
         asyncio.ensure_future(advance(guild, ch))
 
 # ─────────────────────────────────────────────────────────────
@@ -264,8 +358,9 @@ async def ensure_voice(ctx) -> discord.VoiceClient:
 #  COMMANDS
 # ─────────────────────────────────────────────────────────────
 
-# ── PLAY ──────────────────────────────────────────────────────
+# ── PLAY (UX 6 — Cooldown 3s) ────────────────────────────────
 @bot.command(name="play", aliases=["p"])
+@commands.cooldown(1, 3, commands.BucketType.user)
 async def cmd_play(ctx, *, query: str):
     """Phát nhạc YouTube / SoundCloud (URL hoặc tên bài)."""
     await ensure_voice(ctx)
@@ -281,7 +376,7 @@ async def cmd_play(ctx, *, query: str):
     songs = [Song(e, ctx.author) for e in entries]
     state = gs(ctx.guild)
     state.queue.extend(songs)
-    if state.loop: state.history.extend(songs)
+    # [Bug 1 Fix] KHÔNG thêm vào history ở đây — advance() sẽ tự ghi
 
     if len(songs) == 1:
         s = songs[0]
@@ -291,6 +386,38 @@ async def cmd_play(ctx, *, query: str):
     else:
         e = discord.Embed(description=f"✅ Đã thêm **{len(songs)} bài** vào queue.", color=0x1DB954)
         e.add_field(name="📋 Queue", value=f"{len(state.queue)} bài tổng cộng")
+
+    await msg.edit(embed=e)
+    if not state.playing() and not state.paused():
+        await advance(ctx.guild, ctx.channel)
+
+
+# ── PLAYNEXT (UX 5) ──────────────────────────────────────────
+@bot.command(name="playnext", aliases=["pn"])
+@commands.cooldown(1, 3, commands.BucketType.user)
+async def cmd_playnext(ctx, *, query: str):
+    """Thêm bài vào ĐẦU queue (phát ngay sau bài hiện tại)."""
+    await ensure_voice(ctx)
+    msg = await ctx.send(embed=discord.Embed(description=f"🔍 Đang tìm: `{query}`…", color=0x1DB954))
+    try:
+        entries = await fetch_info(query)
+    except commands.CommandError as e:
+        return await msg.edit(embed=discord.Embed(description=str(e), color=0xFF6B6B))
+
+    if not entries:
+        return await msg.edit(embed=discord.Embed(description="❌ Không tìm thấy kết quả.", color=0xFF6B6B))
+
+    songs = [Song(e, ctx.author) for e in entries]
+    state = gs(ctx.guild)
+    # Chèn vào ĐẦU queue
+    for i, s in enumerate(songs):
+        state.queue.insert(i, s)
+
+    if len(songs) == 1:
+        s = songs[0]
+        e = discord.Embed(description=f"⏫ Đã thêm vào **đầu queue**: **[{s.title}]({s.webpage_url})**", color=0x1DB954)
+    else:
+        e = discord.Embed(description=f"⏫ Đã thêm **{len(songs)} bài** vào đầu queue.", color=0x1DB954)
 
     await msg.edit(embed=e)
     if not state.playing() and not state.paused():
@@ -354,55 +481,69 @@ async def cmd_np(ctx):
     state = gs(ctx.guild)
     if not state.current:
         return await ctx.send(embed=discord.Embed(description="❌ Không có bài nào đang phát.", color=0xFF6B6B))
-    await ctx.send(embed=state.current.embed(paused=state.paused()))
+    view = PlayerView(ctx.guild, ctx.channel)
+    await ctx.send(embed=state.current.embed(paused=state.paused()), view=view)
 
 
-# ── QUEUE ──────────────────────────────────────────────────────
+# ── QUEUE (UX 2 — Phân trang) ────────────────────────────────
 @bot.command(name="queue", aliases=["q", "list"])
-async def cmd_queue(ctx):
-    """Xem danh sách phát."""
+async def cmd_queue(ctx, page: int = 1):
+    """Xem danh sách phát. VD: queue 2"""
     state = gs(ctx.guild)
     if not state.current and not state.queue:
         return await ctx.send(embed=discord.Embed(description="📭 Queue trống.", color=0xAAAAAA))
+
+    per_page = 10
+    total_pages = max(1, (len(state.queue) + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
 
     lines = []
     if state.current:
         status = "⏸" if state.paused() else "🎵"
         lines.append(f"{status} **Đang phát:** [{state.current.title}]({state.current.webpage_url}) `[{state.current.duration_fmt}]`")
 
-    for i, s in enumerate(state.queue[:15], 1):
+    start = (page - 1) * per_page
+    end = start + per_page
+    for i, s in enumerate(state.queue[start:end], start + 1):
         lines.append(f"`{i:>2}.` [{s.title}]({s.webpage_url}) `[{s.duration_fmt}]`")
 
-    remaining = len(state.queue) - 15
-    if remaining > 0:
-        lines.append(f"\n_...và {remaining} bài nữa trong queue_")
+    if not state.queue:
+        lines.append("_Queue trống — thêm bài bằng `!play`_")
 
     e = discord.Embed(
         title=f"📋 Queue — {len(state.queue)} bài đang chờ",
         description="\n".join(lines),
         color=0x1DB954,
     )
-    e.set_footer(text=f"🔁 Loop: {'ON' if state.loop else 'OFF'}  |  🔊 Vol: {int(state.volume*100)}%")
+    e.set_footer(text=f"Trang {page}/{total_pages}  |  Loop: {state.loop_label()}  |  🔊 Vol: {int(state.volume*100)}%")
     await ctx.send(embed=e)
 
 
-# ── LOOP ──────────────────────────────────────────────────────
+# ── LOOP (UX 4 — Loop single + Bug 1 Fix) ────────────────────
 @bot.command(name="loop", aliases=["l", "repeat"])
 async def cmd_loop(ctx):
-    """Bật/tắt loop playlist."""
+    """Bật/tắt loop: OFF → Playlist → Single → OFF."""
     state = gs(ctx.guild)
-    state.loop = not state.loop
-    state.history.clear()
-    if state.loop:
+
+    # Cycle: OFF → PLAYLIST → SINGLE → OFF
+    if state.loop == LOOP_OFF:
+        state.loop = LOOP_PLAYLIST
+        state.history.clear()
+        # [Bug 1 Fix] Chỉ add current — advance() sẽ tự ghi các bài từ queue
         if state.current: state.history.append(state.current)
-        state.history.extend(state.queue)
-        desc = "🔁 Loop **BẬT** – Tự phát lại khi hết nhạc."
+        desc = "🔁 Loop **Playlist** – Tự phát lại khi hết nhạc."
+    elif state.loop == LOOP_PLAYLIST:
+        state.loop = LOOP_SINGLE
+        desc = "🔂 Loop **Single** – Lặp lại bài đang phát."
     else:
+        state.loop = LOOP_OFF
+        state.history.clear()
         desc = "➡️ Loop **TẮT**."
+
     await ctx.send(embed=discord.Embed(description=desc, color=0x1DB954))
 
 
-# ── SHUFFLE ────────────────────────────────────────────────────
+# ── SHUFFLE (Bug 2 Fix) ──────────────────────────────────────
 @bot.command(name="shuffle", aliases=["sh"])
 async def cmd_shuffle(ctx):
     """Xáo trộn danh sách phát."""
@@ -410,6 +551,9 @@ async def cmd_shuffle(ctx):
     if not state.queue:
         return await ctx.send("❌ Queue trống.")
     random.shuffle(state.queue)
+    # [Bug 2 Fix] Trộn cả history để vòng loop sau cũng trộn
+    if state.loop == LOOP_PLAYLIST and state.history:
+        random.shuffle(state.history)
     await ctx.send(embed=discord.Embed(description="🔀 Đã xáo trộn queue!", color=0x1DB954))
 
 
@@ -427,15 +571,44 @@ async def cmd_volume(ctx, vol: int):
     await ctx.send(embed=discord.Embed(description=f"🔊 **{vol}%** `{bar}`", color=0x1DB954))
 
 
-# ── REMOVE ────────────────────────────────────────────────────
+# ── REMOVE (UX 3 — Xóa khoảng + Bug 4 Fix) ──────────────────
 @bot.command(name="remove", aliases=["rm", "del"])
-async def cmd_remove(ctx, index: int):
-    """Xóa bài khỏi queue theo số thứ tự. VD: remove 3"""
+async def cmd_remove(ctx, *, arg: str):
+    """Xóa bài khỏi queue. VD: remove 3 hoặc remove 3-10"""
     state = gs(ctx.guild)
-    if not 1 <= index <= len(state.queue):
-        return await ctx.send(f"❌ Số thứ tự không hợp lệ (queue có {len(state.queue)} bài).")
-    removed = state.queue.pop(index - 1)
-    await ctx.send(embed=discord.Embed(description=f"🗑️ Đã xóa: **{removed.title}**", color=0xFF6B6B))
+
+    # Parse "3-10" range or single number
+    range_match = re.match(r"(\d+)\s*-\s*(\d+)", arg)
+    if range_match:
+        start_idx = int(range_match.group(1))
+        end_idx = int(range_match.group(2))
+        if start_idx > end_idx:
+            start_idx, end_idx = end_idx, start_idx
+        if not (1 <= start_idx <= len(state.queue)) or not (1 <= end_idx <= len(state.queue)):
+            return await ctx.send(f"❌ Khoảng không hợp lệ (queue có {len(state.queue)} bài).")
+        removed = state.queue[start_idx - 1 : end_idx]
+        del state.queue[start_idx - 1 : end_idx]
+        # [Bug 4 Fix] Xóa khỏi history khi đang loop
+        if state.loop == LOOP_PLAYLIST:
+            for s in removed:
+                try: state.history.remove(s)
+                except ValueError: pass
+        await ctx.send(embed=discord.Embed(
+            description=f"🗑️ Đã xóa **{len(removed)} bài** (#{start_idx}–#{end_idx}).", color=0xFF6B6B
+        ))
+    else:
+        try:
+            index = int(arg)
+        except ValueError:
+            return await ctx.send("❌ Sai cú pháp. VD: `!remove 3` hoặc `!remove 3-10`")
+        if not 1 <= index <= len(state.queue):
+            return await ctx.send(f"❌ Số thứ tự không hợp lệ (queue có {len(state.queue)} bài).")
+        removed = state.queue.pop(index - 1)
+        # [Bug 4 Fix] Xóa khỏi history khi đang loop
+        if state.loop == LOOP_PLAYLIST:
+            try: state.history.remove(removed)
+            except ValueError: pass
+        await ctx.send(embed=discord.Embed(description=f"🗑️ Đã xóa: **{removed.title}**", color=0xFF6B6B))
 
 
 # ── CLEAR ────────────────────────────────────────────────────
@@ -478,6 +651,7 @@ async def cmd_help(ctx):
     e = discord.Embed(title="🎵 Music Bot — Danh sách lệnh", color=0x1DB954)
     e.add_field(name="▶️ Phát nhạc", inline=False, value=
         f"`{p}play <tên/URL>` — Phát từ YouTube hoặc SoundCloud\n"
+        f"`{p}playnext <tên/URL>` — Thêm vào **đầu** queue\n"
         f"`{p}skip` / `{p}s` — Bỏ qua bài\n"
         f"`{p}stop` — Dừng & xóa queue\n"
         f"`{p}pause` — Tạm dừng\n"
@@ -485,10 +659,10 @@ async def cmd_help(ctx):
         f"`{p}np` — Xem bài đang phát"
     )
     e.add_field(name="📋 Queue", inline=False, value=
-        f"`{p}queue` / `{p}q` — Xem danh sách phát\n"
+        f"`{p}queue [trang]` / `{p}q` — Xem danh sách (VD: `{p}q 2`)\n"
         f"`{p}shuffle` / `{p}sh` — Xáo trộn queue\n"
-        f"`{p}loop` / `{p}l` — Bật/tắt loop playlist\n"
-        f"`{p}remove <số>` / `{p}rm` — Xóa 1 bài\n"
+        f"`{p}loop` / `{p}l` — Chuyển loop: OFF → Playlist → Single → OFF\n"
+        f"`{p}remove <số>` / `{p}rm` — Xóa 1 bài (VD: `{p}rm 3-10`)\n"
         f"`{p}clear` — Xóa sạch hàng chờ (giữ bài đang phát)"
     )
     e.add_field(name="🔊 Điều chỉnh", inline=False, value=
@@ -499,7 +673,8 @@ async def cmd_help(ctx):
     e.add_field(name="💡 Tính năng", inline=False, value=
         "• Bot **không tự rời kênh** (24/7)\n"
         "• Hỗ trợ **YouTube, SoundCloud, Playlist**\n"
-        "• Bật `loop` → tự phát lại khi hết nhạc"
+        "• Bật `loop` → tự phát lại khi hết nhạc\n"
+        "• Nút bấm **[⏸ ⏭ ⏹ 🔀]** trên tin nhắn Now Playing"
     )
     e.set_footer(text="Made with ❤️ by MRX")
     await ctx.send(embed=e)
@@ -516,10 +691,24 @@ async def on_ready():
         type=discord.ActivityType.listening, name=f"{p}play | Music Bot"
     ))
 
+# [Stability Fix] Dọn state khi bot bị kick khỏi voice
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if member.id != bot.user.id:
+        return
+    # Bot bị disconnect (bởi admin hoặc mất kết nối)
+    if before.channel is not None and after.channel is None:
+        state = gs(member.guild)
+        state.reset()
+        state.voice = None
+        print(f"[Voice] Bot bị disconnect khỏi {before.channel.name} — state đã reset.")
+
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
+    if isinstance(error, commands.CommandOnCooldown):
+        return await ctx.send(f"⏳ Chờ {error.retry_after:.1f}s trước khi dùng lại lệnh này.", delete_after=5)
     if isinstance(error, commands.MissingRequiredArgument):
         return await ctx.send(f"❌ Thiếu tham số! Gõ `{PREFIX}help` để xem hướng dẫn.")
     if isinstance(error, commands.BadArgument):

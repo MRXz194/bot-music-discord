@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     libnacl-dev \
     libsodium-dev \
+    libopus-dev \
     python3-dev \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
