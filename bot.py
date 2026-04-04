@@ -273,6 +273,12 @@ async def advance(guild: discord.Guild, ch: discord.TextChannel):
     try:
         # Sync voice
         vc = state.voice or guild.voice_client
+        
+        # [Fix] Chờ reconnect tối đa 3 giây nếu bot vừa bị kéo sang kênh khác
+        for _ in range(6):
+            if vc and vc.is_connected(): break
+            await asyncio.sleep(0.5)
+            
         if not vc or not vc.is_connected():
             state.current = None; state._adv = False; return
         state.voice = vc
@@ -355,8 +361,82 @@ async def ensure_voice(ctx) -> discord.VoiceClient:
     return state.voice
 
 # ─────────────────────────────────────────────────────────────
+#  SEARCH CONTROLS VIEW (UX)
+# ─────────────────────────────────────────────────────────────
+class SearchDropdown(discord.ui.Select):
+    def __init__(self, entries, author: discord.Member):
+        self.entries = entries
+        self.author = author
+        options = []
+        for i, e in enumerate(entries[:5]):
+            title = e.get('title', 'Unknown')[:90] 
+            duration = str(datetime.timedelta(seconds=int(e.get('duration', 0)))) if e.get('duration') else "∞"
+            uploader = e.get('uploader', 'Unknown')[:40]
+            options.append(discord.SelectOption(
+                label=f"{i+1}. {title}",
+                description=f"⏱ {duration} | 👤 {uploader}",
+                value=str(i)
+            ))
+        super().__init__(placeholder="Nhấn vào đây để chọn bài hát...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user != self.author:
+            return await interaction.response.send_message("❌ Bạn không phải người tìm kiếm!", ephemeral=True)
+        
+        idx = int(self.values[0])
+        entry = self.entries[idx]
+        song = Song(entry, self.author)
+        
+        state = gs(interaction.guild)
+        state.queue.append(song)
+        
+        e = discord.Embed(description=f"✅ Đã thêm: **[{song.title}]({song.webpage_url})**", color=0x1DB954)
+        e.add_field(name="⏱", value=song.duration_fmt)
+        e.add_field(name="📋 Queue", value=f"{len(state.queue)} bài")
+        
+        await interaction.message.edit(content=None, embed=e, view=None)
+        await interaction.response.defer()
+        
+        if not state.playing() and not state.paused():
+            vc = interaction.guild.voice_client
+            if vc and vc.is_connected():
+                await advance(interaction.guild, interaction.channel)
+
+class SearchViewUI(discord.ui.View):
+    def __init__(self, entries, author: discord.Member):
+        super().__init__(timeout=60)
+        self.add_item(SearchDropdown(entries, author))
+
+# ─────────────────────────────────────────────────────────────
 #  COMMANDS
 # ─────────────────────────────────────────────────────────────
+
+# ── SEARCH (Dropdown) ────────────────────────────────────────
+@bot.command(name="search", aliases=["find"])
+@commands.cooldown(1, 4, commands.BucketType.user)
+async def cmd_search(ctx, *, query: str):
+    """Tìm nhạc trên YouTube và chọn kết quả."""
+    await ensure_voice(ctx)
+    msg = await ctx.send(embed=discord.Embed(description=f"🔍 Đang tìm 5 kết quả tốt nhất cho: `{query}`…", color=0x1DB954))
+    
+    opts = dict(YTDL_OPTS)
+    opts['extract_flat'] = True
+    ytdl = yt_dlp.YoutubeDL(opts)
+    
+    try:
+        data = await asyncio.wait_for(
+            bot.loop.run_in_executor(None, lambda: ytdl.extract_info(f"ytsearch5:{query}", download=False)),
+            timeout=15.0
+        )
+    except Exception as e:
+        return await msg.edit(embed=discord.Embed(description=str(e), color=0xFF6B6B))
+
+    if not data or 'entries' not in data or not data['entries']:
+        return await msg.edit(embed=discord.Embed(description="❌ Không tìm thấy kết quả.", color=0xFF6B6B))
+
+    entries = data['entries']
+    view = SearchViewUI(entries, ctx.author)
+    await msg.edit(embed=discord.Embed(description=f"🎵 **Kết quả cho:** `{query}`\nChọn 1 bài ở menu bên dưới:", color=0x1DB954), view=view)
 
 # ── PLAY (UX 6 — Cooldown 3s) ────────────────────────────────
 @bot.command(name="play", aliases=["p"])
@@ -651,6 +731,7 @@ async def cmd_help(ctx):
     e = discord.Embed(title="🎵 Music Bot — Danh sách lệnh", color=0x1DB954)
     e.add_field(name="▶️ Phát nhạc", inline=False, value=
         f"`{p}play <tên/URL>` — Phát từ YouTube hoặc SoundCloud\n"
+        f"`{p}search <tên>` — Tìm và chọn bài bằng Dropdown\n"
         f"`{p}playnext <tên/URL>` — Thêm vào **đầu** queue\n"
         f"`{p}skip` / `{p}s` — Bỏ qua bài\n"
         f"`{p}stop` — Dừng & xóa queue\n"
@@ -702,6 +783,13 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         state.reset()
         state.voice = None
         print(f"[Voice] Bot bị disconnect khỏi {before.channel.name} — state đã reset.")
+    # Bot bị kéo sang kênh khác
+    elif before.channel is not None and after.channel is not None and before.channel != after.channel:
+        state = gs(member.guild)
+        if state.voice and state.playing():
+            state.voice.pause()
+            bot.loop.create_task(asyncio.sleep(0.5))
+            state.voice.resume()
 
 @bot.event
 async def on_command_error(ctx, error):
