@@ -262,20 +262,6 @@ class PlayerView(discord.ui.View):
             )
         else:
             await interaction.response.defer()
-        self.stop()
-
-    @discord.ui.button(label="🔀", style=discord.ButtonStyle.secondary)
-    async def btn_shuffle(self, interaction: discord.Interaction, button: discord.ui.Button):
-        state = gs(self.guild)
-        if state.queue:
-            random.shuffle(state.queue)
-            if state.loop == LOOP_PLAYLIST and state.history:
-                random.shuffle(state.history)
-            await interaction.response.send_message(
-                embed=discord.Embed(description="🔀 Đã xáo trộn queue!", color=0x1DB954), delete_after=5
-            )
-        else:
-            await interaction.response.defer()
 
 # ─────────────────────────────────────────────────────────────
 #  ADVANCE QUEUE (Bug 1, 3 fixes)
