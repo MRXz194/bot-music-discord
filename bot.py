@@ -45,7 +45,7 @@ YTDL_OPTS = {
 }
 
 FFMPEG_OPTS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 10M -thread_queue_size 4096",
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 -probesize 10M -thread_queue_size 4096",
     "options": "-vn -b:a 128k",
 }
 
@@ -136,6 +136,8 @@ class GuildState:
         self.volume   = 0.5
         self.voice:   discord.VoiceClient | None = None
         self._adv     = False   # advancing guard
+        self.play_count = 0     # Đếm track bài hát
+        self.error_streak = 0   # Đếm lỗi liên tục
 
     def playing(self): return self.voice is not None and self.voice.is_playing()
     def paused(self):  return self.voice is not None and self.voice.is_paused()
@@ -148,6 +150,7 @@ class GuildState:
     def reset(self):
         self.queue.clear(); self.history.clear()
         self.current = None; self._adv = False
+        self.play_count = 0; self.error_streak = 0
 
 _states: dict[int, GuildState] = {}
 def gs(guild) -> GuildState:
@@ -204,17 +207,15 @@ def make_source(url: str, volume: float) -> discord.PCMVolumeTransformer:
     )
 
 # ─────────────────────────────────────────────────────────────
-#  PLAYER CONTROLS VIEW (UX 1 — Interactive Buttons)
+#  PLAYER CONTROLS VIEW (Persistent View - Không bao giờ lag)
 # ─────────────────────────────────────────────────────────────
 class PlayerView(discord.ui.View):
-    def __init__(self, guild: discord.Guild, ch: discord.TextChannel):
-        super().__init__(timeout=600)  # 10 phút timeout
-        self.guild = guild
-        self.ch = ch
+    def __init__(self):
+        super().__init__(timeout=None)  # Vĩnh viễn không timeout
 
-    @discord.ui.button(label="⏸", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="⏸", style=discord.ButtonStyle.secondary, custom_id="mrx_btn_pause")
     async def btn_pause(self, interaction: discord.Interaction, button: discord.ui.Button):
-        state = gs(self.guild)
+        state = gs(interaction.guild)
         if state.playing():
             state.voice.pause()
             button.label = "▶"
@@ -228,9 +229,9 @@ class PlayerView(discord.ui.View):
         else:
             await interaction.response.defer()
 
-    @discord.ui.button(label="⏭", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="⏭", style=discord.ButtonStyle.primary, custom_id="mrx_btn_skip")
     async def btn_skip(self, interaction: discord.Interaction, button: discord.ui.Button):
-        state = gs(self.guild)
+        state = gs(interaction.guild)
         if state.playing() or state.paused():
             state.voice.stop()
             await interaction.response.send_message(
@@ -239,15 +240,28 @@ class PlayerView(discord.ui.View):
         else:
             await interaction.response.defer()
 
-    @discord.ui.button(label="⏹", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="⏹", style=discord.ButtonStyle.danger, custom_id="mrx_btn_stop")
     async def btn_stop(self, interaction: discord.Interaction, button: discord.ui.Button):
-        state = gs(self.guild)
+        state = gs(interaction.guild)
         state.reset()
         if state.voice and state.voice.is_connected():
             state.voice.stop()
         await interaction.response.send_message(
             embed=discord.Embed(description="⏹️ Đã dừng và xóa queue.", color=0xFF6B6B), delete_after=5
         )
+
+    @discord.ui.button(label="🔀", style=discord.ButtonStyle.secondary, custom_id="mrx_btn_shuffle")
+    async def btn_shuffle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = gs(interaction.guild)
+        if state.queue:
+            random.shuffle(state.queue)
+            if state.loop == LOOP_PLAYLIST and state.history:
+                random.shuffle(state.history)
+            await interaction.response.send_message(
+                embed=discord.Embed(description="🔀 Đã xáo trộn queue!", color=0x1DB954), delete_after=5
+            )
+        else:
+            await interaction.response.defer()
         self.stop()
 
     @discord.ui.button(label="🔀", style=discord.ButtonStyle.secondary)
@@ -300,20 +314,37 @@ async def advance(guild: discord.Guild, ch: discord.TextChannel):
             except: pass
             state._adv = False; return
 
-        # [Bug 3 Fix] Refresh track — skip on failure
+        # [Bug 3 Fix] Refresh track — skip on failure, protect queue
         ok = await refresh_song(song)
         if not ok:
-            try:
-                await ch.send(embed=discord.Embed(
+            state.error_streak += 1
+            if state.error_streak >= 3:
+                try: await ch.send(embed=discord.Embed(description=f"❌ Vẫn lỗi tải bài. YouTube block IP hoặc rớt mạng. Tạm ngưng 15s để né lỗi. KHÔNG MẤT QUEUE!", color=0xFF6B6B))
+                except: pass
+                # Đặt bài lại vị trí cũ để không trôi mất queue 100 tiếng
+                state.queue.insert(0, song)
+                state._adv = False
+                await asyncio.sleep(15)
+                asyncio.ensure_future(advance(guild, ch))
+                return
+            else:
+                try: await ch.send(embed=discord.Embed(
                     description=f"❌ Không thể tải **{song.title}**, tự bỏ qua...", color=0xFF6B6B
                 ))
-            except: pass
-            state._adv = False
-            await asyncio.sleep(2)  # tránh spam khi nhiều bài lỗi liên tiếp
-            asyncio.ensure_future(advance(guild, ch))
-            return
+                except: pass
+                state._adv = False
+                await asyncio.sleep(2)
+                asyncio.ensure_future(advance(guild, ch))
+                return
 
+        state.error_streak = 0
         state.current = song
+        
+        # [Track Counter Fix] Tịnh tiến đếm bài cho chuẩn
+        state.play_count += 1
+        pos = state.play_count if state.loop != LOOP_PLAYLIST else len(state.history) + 1
+        tot = (state.play_count - 1) + 1 + len(state.queue) if state.loop != LOOP_PLAYLIST else len(state.history) + 1 + len(state.queue)
+
         # [Bug 1 Fix] Chỉ ghi history tại đây — nguồn DUY NHẤT
         if state.loop == LOOP_PLAYLIST: state.history.append(song)
 
@@ -325,9 +356,7 @@ async def advance(guild: discord.Guild, ch: discord.TextChannel):
         src = make_source(song.url, state.volume)
         if state.voice and state.voice.is_connected():
             state.voice.play(src, after=after)
-            pos = len(state.history) if state.loop == LOOP_PLAYLIST else 1
-            tot = len(state.history)+len(state.queue) if state.loop == LOOP_PLAYLIST else len(state.queue)+1
-            view = PlayerView(guild, ch)
+            view = PlayerView()
             try: await ch.send(embed=song.embed(pos, tot, paused=False), view=view)
             except: pass
         else:
@@ -561,8 +590,11 @@ async def cmd_np(ctx):
     state = gs(ctx.guild)
     if not state.current:
         return await ctx.send(embed=discord.Embed(description="❌ Không có bài nào đang phát.", color=0xFF6B6B))
-    view = PlayerView(ctx.guild, ctx.channel)
-    await ctx.send(embed=state.current.embed(paused=state.paused()), view=view)
+    view = PlayerView()
+    
+    pos = state.play_count if state.loop != LOOP_PLAYLIST else len(state.history)
+    tot = (state.play_count - 1) + 1 + len(state.queue) if state.loop != LOOP_PLAYLIST else len(state.history) + len(state.queue)
+    await ctx.send(embed=state.current.embed(pos, tot, paused=state.paused()), view=view)
 
 
 # ── QUEUE (UX 2 — Phân trang) ────────────────────────────────
@@ -764,6 +796,11 @@ async def cmd_help(ctx):
 # ─────────────────────────────────────────────────────────────
 #  EVENTS
 # ─────────────────────────────────────────────────────────────
+@bot.event
+async def setup_hook():
+    # Persistent view (Nút bấm vĩnh viễn)
+    bot.add_view(PlayerView())
+
 @bot.event
 async def on_ready():
     print(f"✅ {bot.user} online! Prefix: '{PREFIX}'")
