@@ -27,8 +27,9 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix=get_prefix, intents=intents, help_command=None)
 
 # ─────────────────────────────────────────────────────────────
-#  YTDL / FFMPEG
-# ─────────────────────────────────────────────────────────────
+# [Anti-Bot / Cookies Fix]
+COOKIE_FILE = "/app/cookies.txt" if os.path.exists("/app/cookies.txt") else ("cookies.txt" if os.path.exists("cookies.txt") else None)
+
 YTDL_OPTS = {
     "format": "bestaudio/best",
     "noplaylist": False,
@@ -41,12 +42,18 @@ YTDL_OPTS = {
     "socket_timeout": 15,
     "retries": 3,
     "extract_flat": "in_playlist",
-    "extractor_args": {"youtube": {"skip": ["dash", "hls"], "player_client": ["android", "web"]}},
+    # Ưu tiên client ios/android thay vì web để né xác thực "Sign in to confirm you're not a bot"
+    "extractor_args": {"youtube": {"skip": ["dash", "hls"], "player_client": ["ios", "android"]}},
 }
 
+if COOKIE_FILE:
+    YTDL_OPTS["cookiefile"] = COOKIE_FILE
+    print(f"🍪 Đã cấu hình Cookies từ file: {COOKIE_FILE}")
+
 FFMPEG_OPTS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 -probesize 10M -thread_queue_size 4096",
-    "options": "-vn -b:a 128k",
+    # Tối ưu thread_queue_size xuống 1024 và audio bitrate xuống 96k để giảm tải CPU/băng thông trên VPS, giúp giữ ping thấp ổn định
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 -probesize 10M -thread_queue_size 1024",
+    "options": "-vn -b:a 96k",
 }
 
 def _find_ffmpeg():
