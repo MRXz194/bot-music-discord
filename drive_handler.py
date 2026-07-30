@@ -12,13 +12,14 @@ from typing import Optional
 
 # Regex patterns
 _FILE_PATTERN   = re.compile(r"drive\.google\.com/file/d/([a-zA-Z0-9_-]+)")
-_FOLDER_PATTERN = re.compile(r"drive\.google\.com/drive/folders/([a-zA-Z0-9_-]+)")
+_FOLDER_PATTERN = re.compile(r"drive\.google\.com/drive/(?:u/\d+/)?folders/([a-zA-Z0-9_-]+)")
 _OPEN_PATTERN   = re.compile(r"drive\.google\.com/open\?id=([a-zA-Z0-9_-]+)")
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".wma", ".opus"}
 
 TEMP_DIR = Path("temp_audio")
 TEMP_DIR.mkdir(exist_ok=True)
+
 
 
 # ──────────────────────────────────────────────
@@ -158,24 +159,32 @@ async def _fetch_folder_listing(folder_id: str) -> list[dict]:
 
     try:
         async with aiohttp.ClientSession() as session:
-            headers = {"User-Agent": "Mozilla/5.0 (compatible; MusicBot/1.0)"}
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                 if resp.status != 200:
                     return []
                 html = await resp.text()
 
-        # Tìm file IDs trong response HTML (pattern Google Drive dùng)
-        file_ids = re.findall(r'"([a-zA-Z0-9_-]{28,})"', html)
-        file_ids = list(dict.fromkeys(file_ids))  # deduplicate, giữ order
+        # Parse Google Drive HTML for audio items
+        # Matches aria-label="FILENAME.ext..." and corresponding ssk='5:...:FILE_ID-...'
+        pattern = r'aria-label="([^"]+?\.(?:mp3|wav|flac|m4a|ogg|aac|wma|opus))[^"]*".*?ssk=\'5:[^:]*:([a-zA-Z0-9_-]{28,40})-'
+        matches = re.findall(pattern, html, re.DOTALL | re.IGNORECASE)
 
-        # Build tracks từ file IDs (heuristic, chỉ lấy max 50 files)
-        for fid in file_ids[:50]:
-            # Kiểm tra xem có phải file audio bằng cách check metadata
-            # Dùng direct URL
+        seen_ids = set()
+        for title, fid in matches:
+            # Remove trailing '-0' or extra suffix if present
+            clean_fid = fid.rsplit('-', 1)[0] if '-' in fid else fid
+            if clean_fid in seen_ids:
+                continue
+            seen_ids.add(clean_fid)
+
+            # Clean title
+            clean_title = title.strip()
+
             tracks.append({
-                "title":       f"GDrive File ({fid[:8]}...)",
-                "url":         get_direct_download_url(fid),
-                "webpage_url": get_stream_url(fid),
+                "title":       clean_title,
+                "url":         get_direct_download_url(clean_fid),
+                "webpage_url": get_stream_url(clean_fid),
                 "duration":    0,
                 "thumbnail":   "",
                 "uploader":    "Google Drive",

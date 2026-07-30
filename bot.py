@@ -96,7 +96,9 @@ class Song:
     def __init__(self, data: dict, requester: discord.Member):
         self.url         = data.get("url", "")
         self.webpage_url = data.get("webpage_url", data.get("url", ""))
-        self.title       = data.get("title", "Unknown")
+        raw_title        = data.get("title", "Unknown") or "Unknown"
+        # Sanitize title for Markdown link safety in Embeds
+        self.title       = raw_title.replace("[", "(").replace("]", ")")
         self.duration    = data.get("duration") or 0
         self.thumbnail   = data.get("thumbnail", "")
         self.uploader    = data.get("uploader", "Unknown")
@@ -196,8 +198,8 @@ async def fetch_info(query: str) -> list[dict]:
 
 async def refresh_song(song: Song) -> bool:
     """Re-extract fresh stream URL for a song. Returns True on success."""
-    # Local file — không cần refresh
-    if song.source == "local" or (song.url and song.url.startswith("local://")):
+    # Local file & Google Drive — không cần refresh yt-dlp
+    if song.source in ("local", "gdrive") or (song.url and song.url.startswith("local://")) or "drive.google.com" in (song.url or ""):
         return True
     try:
         opts = dict(YTDL_OPTS)
@@ -213,7 +215,8 @@ async def refresh_song(song: Song) -> bool:
         )
         if data and data.get("url"):
             song.url       = data.get("url", song.url)
-            song.title     = data.get("title", song.title) or "Unknown"
+            raw_t          = data.get("title", song.title) or "Unknown"
+            song.title     = raw_t.replace("[", "(").replace("]", ")")
             song.duration  = data.get("duration") or song.duration
             song.thumbnail = data.get("thumbnail", song.thumbnail)
             song.uploader  = data.get("uploader", song.uploader) or "Unknown"
@@ -229,11 +232,19 @@ def make_source(song: Song, volume: float) -> discord.PCMVolumeTransformer:
     # Resolve local file path
     if song.source == "local" or url.startswith("local://"):
         url = dh.resolve_local_url(url)
-        # Local files: không cần reconnect options
         local_opts = dict(FFMPEG_OPTS)
         local_opts["before_options"] = "-thread_queue_size 4096"
         return discord.PCMVolumeTransformer(
             discord.FFmpegPCMAudio(url, **local_opts), volume=volume
+        )
+    elif song.source == "gdrive" or "drive.google.com" in url:
+        gdrive_opts = dict(FFMPEG_OPTS)
+        gdrive_opts["before_options"] = (
+            '-headers "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"\r\n '
+            '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 -probesize 10M -thread_queue_size 4096'
+        )
+        return discord.PCMVolumeTransformer(
+            discord.FFmpegPCMAudio(url, **gdrive_opts), volume=volume
         )
     return discord.PCMVolumeTransformer(
         discord.FFmpegPCMAudio(url, **FFMPEG_OPTS), volume=volume
@@ -790,6 +801,13 @@ async def _load_playlist_to_queue(ctx_or_interaction, pl_data: dict, shuffle: bo
 
     if not state.playing() and not state.paused():
         vc = guild.voice_client
+        if not vc or not vc.is_connected():
+            if hasattr(requester, 'voice') and requester.voice and requester.voice.channel:
+                try:
+                    vc = await requester.voice.channel.connect(timeout=20.0, reconnect=True, self_deaf=True)
+                    state.voice = vc
+                except Exception as err:
+                    print(f"[Voice Connect Error] {err}")
         if vc and vc.is_connected():
             await advance(guild, channel)
 
